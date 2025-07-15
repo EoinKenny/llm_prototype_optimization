@@ -1,0 +1,13 @@
+lm_proto_env/
+trash/
+weights/
+datasets/20newsgroups/
+datasets/agnews/
+datasets/amazon_reviews/
+datasets/dbpedia/
+datasets/imdb/
+datasets/preprocess/
+datasets/trec/
+data/
+Analyze.ipynb
+.ipynb_checkpoints/
