@@ -21,6 +21,8 @@ def clean_gpus() -> None:
     torch.cuda.empty_cache() 
 clean_gpus()
 
+hugging_token = ???
+
 
 # --- Polarized Classification Layer ---
 class PolarizedClassificationLayer(nn.Module):
@@ -66,8 +68,12 @@ class LMProtoNet(nn.Module):
     def __init__(self, backbone: nn.Module,
                  num_labels: int = 2,
                  num_protos_per_class: int = 5,
-                 init_prototypes: torch.Tensor = None):
+                 init_prototypes: torch.Tensor = None,
+                 baseline=True,
+                ):
         super().__init__()
+
+        self.baseline = baseline
 
         self.backbone = backbone
         self.num_labels = num_labels
@@ -77,7 +83,6 @@ class LMProtoNet(nn.Module):
 
         if not self.backbone.no_llm_head and self.backbone.model_type == 'llm':
             latent_size=self.backbone.prototype_dim
-        
         
         if self.backbone.model_type == 'bert':
             prototype_dim = latent_size
@@ -104,10 +109,8 @@ class LMProtoNet(nn.Module):
             self.prototypes = nn.Parameter(proto_tensor)
 
         # ----- linear classifier over prototype activations -----
-        # self.classfn_model = nn.Linear(self.num_total_prototypes, num_labels, bias=False)
-        # self.classfn_model = nn.Linear(latent_size, num_labels, bias=False)
-        self.classfn_model = PolarizedClassificationLayer(self.num_labels, num_protos_per_class)
-        # init.xavier_uniform_(self.classfn_model.weight, gain=1.0)
+        self.classfn_model = nn.Linear(self.num_total_prototypes, num_labels, bias=False)
+        init.xavier_uniform_(self.classfn_model.weight, gain=1.0)
         self.classfn_model.to(self.device)
 
 
@@ -125,9 +128,7 @@ class LMProtoNet(nn.Module):
 
         # Cosine similarities
         loss_acts = 1 - (cls_rep_norm @ proto_norm.T)
-        # print('experiment with making acts positive only')
-        # breakpoint()
-        acts = cls_rep_norm @ proto_norm.T
+        acts      = cls_rep_norm @ proto_norm.T
         
         l_p1 = loss_acts.min(dim=0).values.mean() 
         l_p2 = loss_acts.min(dim=1).values.mean()   
@@ -139,7 +140,6 @@ class LMProtoNet(nn.Module):
 
         # Classification logits
         logits = self.classfn_model(acts)                          # [B, C]
-        # logits = self.classfn_model(rep)                         # [B, C]
         return {
             "logits": logits,
             "acts": acts,

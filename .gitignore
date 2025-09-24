@@ -1,6 +1,11 @@
+Analysis - Training Expt.ipynb
+output.log
 lm_proto_env/
 trash/
+src/__pycache__/
+__pycache__/
 weights/
+plots/
 datasets/20newsgroups/
 datasets/agnews/
 datasets/amazon_reviews/

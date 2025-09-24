@@ -13,8 +13,10 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 
-from models import ModelWrapper
-
+try:
+    from src.models import ModelWrapper
+except:
+    from models import ModelWrapper
 
 def make_initial_prompt_str(ground_truth_examples, num_guesses_to_generate, dataset_name):
     
@@ -27,6 +29,12 @@ def make_initial_prompt_str(ground_truth_examples, num_guesses_to_generate, data
         description = 'news article'
     elif dataset_name == 'dbpedia':
         description = 'factual wikipedia page'
+    elif dataset_name == 'imdb':
+        description = 'movie review'
+    elif dataset_name == 'amazon_reviews':
+        description = 'Amazon Review'
+    elif dataset_name == 'agnews':
+        description = 'News Article'
     else:
         raise NameError('wrong dataset name')    
     prompt = f"""I am trying to identify a prototypical example from the '{dataset_name}' dataset.
@@ -429,200 +437,9 @@ def evaluate_loaders(train_loader_non_random, val_loader, model, device, just_ev
             total_val_correct += (preds == labels).sum().item()
     orig_val_acc = total_val_correct / len(val_loader.dataset)
     
-    # # Print activations per prototype and class for validation set
-    # print("\nValidation Set Prototype Activations by Class:")
-    # print("-" * 50)
-    # for p in range(num_total_prototypes):
-    #     activation_str = f"Prototype {p}: "
-    #     for c in range(num_classes):
-    #         count = val_proto_class_activations[p, c].item()
-    #         if count > 0:
-    #             activation_str += f"{count:.0f} times class {c}, "
-    #     # Remove trailing comma and space
-    #     activation_str = activation_str.rstrip(", ")
-    #     print(activation_str)
-    
-    # # Check for completely inactive prototypes
-    # train_inactive = torch.sum(torch.sum(train_proto_class_activations, dim=1) == 0).item() if not just_eval else 0
-    # val_inactive = torch.sum(torch.sum(val_proto_class_activations, dim=1) == 0).item()
-    
-    # if train_inactive > 0 and not just_eval:
-    #     print(f"\nWARNING: {train_inactive} prototypes never maximally activated in training set!")
-    # if val_inactive > 0:
-    #     print(f"\nWARNING: {val_inactive} prototypes never maximally activated in validation set!")
-    
-    # # Calculate diversity metrics
-    # import numpy as np
-    
-    # # 1. Calculate entropy-based diversity for training set
-    # if not just_eval:
-    #     train_total_activations = torch.sum(train_proto_class_activations).item()
-    #     if train_total_activations > 0:
-    #         # Calculate probability of each prototype being activated
-    #         train_proto_probs = torch.sum(train_proto_class_activations, dim=1) / train_total_activations
-    #         # Filter out zeros to avoid log(0)
-    #         train_proto_probs = train_proto_probs[train_proto_probs > 0].cpu().numpy()
-    #         # Calculate entropy
-    #         train_entropy = -np.sum(train_proto_probs * np.log(train_proto_probs))
-    #         # Normalize by maximum possible entropy
-    #         max_entropy = np.log(num_total_prototypes)
-    #         train_diversity_score = train_entropy / max_entropy if max_entropy > 0 else 0.0
-    #         print(f"\nTraining Set Diversity Score: {train_diversity_score:.4f} (0-1 scale, higher is better)")
-    
-    # # 2. Calculate entropy-based diversity for validation set
-    # val_total_activations = torch.sum(val_proto_class_activations).item()
-    # if val_total_activations > 0:
-    #     # Calculate probability of each prototype being activated
-    #     val_proto_probs = torch.sum(val_proto_class_activations, dim=1) / val_total_activations
-    #     # Filter out zeros to avoid log(0)
-    #     val_proto_probs = val_proto_probs[val_proto_probs > 0].cpu().numpy()
-    #     # Calculate entropy
-    #     val_entropy = -np.sum(val_proto_probs * np.log(val_proto_probs))
-    #     # Normalize by maximum possible entropy
-    #     max_entropy = np.log(num_total_prototypes)
-    #     val_diversity_score = val_entropy / max_entropy if max_entropy > 0 else 0.0
-    #     print(f"Validation Set Diversity Score: {val_diversity_score:.4f} (0-1 scale, higher is better)")
-    
-    # # 3. Calculate a Gini coefficient as an alternate metric (lower is more equal/diverse)
-    # if not just_eval:
-    #     train_counts = torch.sum(train_proto_class_activations, dim=1).cpu().numpy()
-    #     if np.sum(train_counts) > 0:
-    #         train_counts = np.sort(train_counts)
-    #         n = len(train_counts)
-    #         cumsum = np.cumsum(train_counts)
-    #         train_gini = (n + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n if cumsum[-1] > 0 else 0
-    #         print(f"Training Set Gini Coefficient: {train_gini:.4f} (0-1 scale, lower is better)")
-    
-    # val_counts = torch.sum(val_proto_class_activations, dim=1).cpu().numpy()
-    # if np.sum(val_counts) > 0:
-    #     val_counts = np.sort(val_counts)
-    #     n = len(val_counts)
-    #     cumsum = np.cumsum(val_counts)
-    #     val_gini = (n + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n if cumsum[-1] > 0 else 0
-    #     print(f"Validation Set Gini Coefficient: {val_gini:.4f} (0-1 scale, lower is better)")
-    
     model.train()
     return orig_train_acc, orig_val_acc
 
-
-# def evaluate_loaders(train_loader_non_random, val_loader, model, device, just_eval=False):
-#     import torch
-#     from tqdm import tqdm
-
-#     model.eval()
-#     # Initialize counters for prototype activations per class
-#     num_total_prototypes = model.num_total_prototypes
-#     num_classes = model.num_labels
-
-#     # Create counters for each prototype x class combination
-#     # Shape: [num_total_prototypes, num_classes]
-#     train_proto_class_activations = torch.zeros((num_total_prototypes, num_classes), device=device)
-#     val_proto_class_activations = torch.zeros((num_total_prototypes, num_classes), device=device)
-
-#     # Initialize per-class accuracy counters
-#     val_class_correct = torch.zeros(num_classes, device=device)
-#     val_class_total = torch.zeros(num_classes, device=device)
-
-#     if not just_eval:
-#         total_train_correct = 0
-#         for batch in tqdm(train_loader_non_random, desc="Evaluating training acc"):
-#             with torch.no_grad():
-#                 # Get logits and activations
-#                 if model.backbone.model_type == 'bert':
-#                     labels = batch['labels'].to(device)
-#                     outputs = model(
-#                         input_ids=batch['input_ids'].to(device),
-#                         attention_mask=batch['attention_mask'].to(device),
-#                         forward_type='train'
-#                     )
-#                 elif model.backbone.model_type == 'llm':
-#                     labels = batch[1].to(device)
-#                     outputs = model(
-#                         llm_encodings=batch[0].to(device),
-#                         forward_type='train'
-#                     )
-#                 all_similarities = outputs['acts']
-#                 logits = outputs['logits']
-
-#                 # Track which prototypes are maximally activated for each example
-#                 max_proto_indices = torch.argmax(all_similarities, dim=1)
-#                 for proto_idx, class_idx in zip(max_proto_indices, labels):
-#                     train_proto_class_activations[proto_idx, class_idx] += 1
-
-#                 # Track overall train accuracy
-#                 preds = torch.argmax(logits, dim=1)
-#                 total_train_correct += (preds == labels).sum().item()
-#         orig_train_acc = total_train_correct / len(train_loader_non_random.dataset)
-
-#         # Print activations per prototype and class
-#         print("\nTraining Set Prototype Activations by Class:")
-#         print("-" * 50)
-#         for p in range(num_total_prototypes):
-#             activation_str = f"Prototype {p}: "
-#             for c in range(num_classes):
-#                 count = train_proto_class_activations[p, c].item()
-#                 if count > 0:
-#                     activation_str += f"{int(count)} times class {c}, "
-#             print(activation_str.rstrip(", "))
-#     else:
-#         orig_train_acc = 0.0
-
-#     total_val_correct = 0
-#     for batch in tqdm(val_loader, desc="Evaluating validation acc"):
-#         with torch.no_grad():
-#             # Get logits and activations
-#             if model.backbone.model_type == 'bert':
-#                 labels = batch['labels'].to(device)
-#                 outputs = model(
-#                     input_ids=batch['input_ids'].to(device),
-#                     attention_mask=batch['attention_mask'].to(device),
-#                     forward_type='train'
-#                 )
-#             elif model.backbone.model_type == 'llm':
-#                 labels = batch[1].to(device)
-#                 outputs = model(
-#                     llm_encodings=batch[0].to(device),
-#                     forward_type='train'
-#                 )
-#             all_similarities = outputs['acts']
-#             logits = outputs['logits']
-
-#             # Track which prototypes are maximally activated for each example
-#             max_proto_indices = torch.argmax(all_similarities, dim=1)
-#             for proto_idx, class_idx in zip(max_proto_indices, labels):
-#                 val_proto_class_activations[proto_idx, class_idx] += 1
-
-#             # Track per-class validation accuracy
-#             preds = torch.argmax(logits, dim=1)
-#             for pred, label in zip(preds, labels):
-#                 val_class_total[label] += 1
-#                 if pred == label:
-#                     val_class_correct[label] += 1
-
-#             total_val_correct += (preds == labels).sum().item()
-#     orig_val_acc = total_val_correct / len(val_loader.dataset)
-
-#     # Print overall validation accuracy
-#     print(f"\nValidation Accuracy: {orig_val_acc:.4f}")
-
-#     # Compute per-class accuracies
-#     per_class_acc = val_class_correct / val_class_total.clamp(min=1)
-#     # Sort classes by accuracy ascending
-#     sorted_acc, sorted_indices = torch.sort(per_class_acc)
-#     worst_k = min(20, num_classes)
-#     worst_indices = sorted_indices[:worst_k]
-
-#     # Print worst classes
-#     print(f"\nWorst {worst_k} Classes by Accuracy:")
-#     print("-" * 40)
-#     for idx in worst_indices:
-#         acc = per_class_acc[idx].item()
-#         total = int(val_class_total[idx].item())
-#         correct = int(val_class_correct[idx].item())
-#         print(f"Class {int(idx)}: {acc:.4f} ({correct}/{total})")
-
-#     model.train()
-#     return orig_train_acc, orig_val_acc
 
 
 

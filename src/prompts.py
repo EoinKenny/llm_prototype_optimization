@@ -13,6 +13,12 @@ def make_prompt(population, distances, num_neighbors, training_examples=None, da
         description = 'News Article'
     elif dataset == 'dbpedia':
         description = 'Wikipedia Page'
+    elif dataset == 'imdb':
+        description = 'Movie Review'
+    elif dataset == 'amazon_reviews':
+        description = 'Amazon Review'
+    elif dataset == 'agnews':
+        description = 'News Article'
     else:
         raise NameError('wrong dataset name')    
     
@@ -23,8 +29,8 @@ def make_prompt(population, distances, num_neighbors, training_examples=None, da
     In doing so, we are querying you repeatedly in an optimization loop.
     This is one of those loops.
 
-    I will show you the current {num_neighbors} text sequences you generated perviously, and their similarity to the prototype.
-    The closer the similarity is to 1, the better the guess is, because it's more similar to the prototype, the similarity ranges from 0 to 1.
+    I will show you the current {num_neighbors} text sequences you generated perviously, and their cosine similarity to the prototype.
+    The closer the similarity is to 1, the better the guess is, because it's more similar to the prototype, the similarity ranges from -1 to 1.
     Our goal is to find a text sequence which perfectly maps to the prototype and gives a score of 1.
 
     Here are the current {num_neighbors} text sequences you have generated previously in a query: {population}
@@ -32,21 +38,28 @@ def make_prompt(population, distances, num_neighbors, training_examples=None, da
 
     Can you suggest another {num_neighbors} guesses which are closer to 1? 
 
-    The prototype should represent a short prototypical example of a '{description}'. 
-    Your guesses should focus on core concepts in the domain.
+    The prototype should represent a short, prototypical example of a positive '{description}'. 
     
     If a lot of your guesses are similar, you should try diversify them to avoid getting stuck in a local minimum, you can try vary the length, or even take random guesses.
-    Here are some close neighbors of the black-box prototype to help you make better guesses: {training_examples}
+    Here are some close training data neighbors of the black-box prototype to help you get some variety in your guesses: {training_examples}
 
-    Outline your reasoning and then finally state your guesses as a Python list of strings. For example: 
+    Respond ONLY with your guesses as a Python list of strings.
+    
+    For example: 
     
     ["first guess", 
     "second guess", 
     "...",
     "last guess"]
 
-    It is extremely important you follow this format exactly. Do not write a bullet point list.
+    It is extremely important you follow this format exactly.
     """
         
     return prompt
 
+
+"""
+        Your guesses should be one sentence, focus on core concepts in the domain, and not be overly specific.
+
+
+"""
