@@ -8,10 +8,6 @@ import gc
 from typing import Dict, Any, Optional, Tuple, Union
 
 from transformers import (
-    # ModernBertConfig, ModernBertModel,
-    # BertConfig, BertModel, BertTokenizer,
-    # ElectraConfig, ElectraModel, ElectraTokenizer,
-    # RobertaConfig, RobertaModel, RobertaTokenizer,
     AutoConfig, AutoModel, AutoTokenizer
 )
 
@@ -21,7 +17,7 @@ def clean_gpus() -> None:
     torch.cuda.empty_cache() 
 clean_gpus()
 
-hugging_token = ???
+hugging_token = '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'
 
 
 # --- Polarized Classification Layer ---

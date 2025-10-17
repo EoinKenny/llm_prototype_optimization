@@ -209,7 +209,7 @@ def load_domain(args):
     num_labels = len(train_df['label'].value_counts())
 
     # ──────────────── STEP 2: Instantiate BackBone ────────────────
-    model = ModelWrapper(model_name=args.model, device=args.device, no_llm_head=args.no_llm_head, prototype_dim=args.prototype_dim)
+    model = ModelWrapper(model_name=args.model, device=args.device, no_llm_head=True, prototype_dim=args.prototype_dim)
 
     # We can grab the config directly from the model object:
     config = model.config
