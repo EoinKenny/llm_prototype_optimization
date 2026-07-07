@@ -1,578 +1,341 @@
-import zipfile
+"""Shared data, evaluation, checkpoint, and embedding utilities."""
+from __future__ import annotations
+
+import json
 import os
-import torch
-import pandas as pd
-import torch.nn as nn
-import torch.nn.functional as F
 import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
 
-from typing import Dict, Any, Optional, Tuple
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 from sklearn.cluster import KMeans
-from torch.utils.data import DataLoader, TensorDataset, Dataset
-from tqdm import tqdm
-from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, Subset
+from tqdm import tqdm
 
-try:
-    from src.models import ModelWrapper
-except:
-    from models import ModelWrapper
-
-def make_initial_prompt_str(ground_truth_examples, num_guesses_to_generate, dataset_name):
-    
-    examples_to_show = ground_truth_examples[:min(5, len(ground_truth_examples))]
-    examples_str = "\n".join([f'- "{ex}"' for ex in examples_to_show])
-    
-    if dataset_name == 'trec':
-        description = 'question'
-    elif dataset_name == '20newsgroups':
-        description = 'news article'
-    elif dataset_name == 'dbpedia':
-        description = 'factual wikipedia page'
-    elif dataset_name == 'imdb':
-        description = 'movie review'
-    elif dataset_name == 'amazon_reviews':
-        description = 'Amazon Review'
-    elif dataset_name == 'agnews':
-        description = 'News Article'
-    else:
-        raise NameError('wrong dataset name')    
-    prompt = f"""I am trying to identify a prototypical example from the '{dataset_name}' dataset.
-    The prototype should represent a typical example of a '{description}'.
-The following examples are very similar to the real prototype:
-{examples_str}
-
-Based *only* on these examples, please generate a Python list containing exactly {num_guesses_to_generate} distinct, concise, and relevant phrases or sentences that you believe also capture the core concepts in these examples in a prototypical sentence.
-Each phrase should be a potential textual description of the prototype and its core concepts.
-Your output must be ONLY a single Python list of strings. For example: ["first candidate phrase", "second candidate phrase", ..., "tenth candidate phrase"]
-
-Generated Python list:
-"""    
-    return prompt
+from src.config import CACHE_DIR, INPUT_LENGTH, PREPROCESS_DIR, TRAIN_FRACTION
+from src.models import LMProtoNet, ModelWrapper
 
 
-
-def compute_embeddings(model, train_loader_non_random):
-
-    model.eval()
-    all_reps = []
-    device = model.backbone.device
-
-    print('getting embeddings...')
-    with torch.no_grad():
-        for batch in tqdm(train_loader_non_random):
-
-            # Get logits & labels
-            if model.backbone.model_type=='bert':
-                reps = model(input_ids=batch['input_ids'].to(device) , attention_mask=batch['attention_mask'].to(device), forward_type='train')
-            elif model.backbone.model_type=='llm':
-                reps = model(llm_encodings=batch[0].to(device), forward_type='train')
-            else:
-                raise NameError('wrong')
-    
-            all_reps.append(reps['cls_rep_normalized'].detach().cpu())   # stay on original device
-
-    return torch.cat(all_reps, dim=0)
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-class EmbeddingDataset(Dataset):
-    """
-    Holds a matrix of pre-computed sentence/document embeddings
-    and a matching 1-D array/tensor of integer labels.
-    """
-    def __init__(self, embeddings: torch.Tensor, labels):
-        # Store embeddings as float32 and labels as int64/long
-        self.embeddings = embeddings.float()          # (N, D)
-        self.labels = torch.as_tensor(labels,
-                                      dtype=torch.long)  # (N,)
+class TokenizedDataset(Dataset):
+    def __init__(self, encodings: dict[str, torch.Tensor], labels: Sequence[int]) -> None:
+        self.encodings = encodings
+        self.labels = torch.as_tensor(labels, dtype=torch.long)
+        if len(self.labels) != len(next(iter(encodings.values()))):
+            raise ValueError("Token encodings and labels have different lengths")
 
-        assert len(self.embeddings) == len(self.labels), \
-            "Embeddings and labels must have the same length"
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx):
-        # Returns a single (embedding, label) tuple
-        return self.embeddings[idx], self.labels[idx]
-
-
-class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels):
-        """
-        encodings: a dict returned by tokenizer(..., return_tensors="pt")
-        labels: a numpy array or list of integer labels
-        """
-        self.encodings = encodings
-        self.labels = labels
-
-    def __getitem__(self, idx):
-        # We clone and detach each tensor so that PyTorch doesn’t complain
-        item = {key: val[idx].clone().detach() for key, val in self.encodings.items()}
-        item['labels'] = torch.tensor(self.labels[idx], dtype=torch.long)
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        item = {name: tensor[index] for name, tensor in self.encodings.items()}
+        item["labels"] = self.labels[index]
         return item
 
-    def __len__(self):
-        return len(self.labels)
+
+@dataclass
+class DomainData:
+    backbone: ModelWrapper
+    tokenizer: object
+    train_df: pd.DataFrame
+    test_df: pd.DataFrame
+    train_dataset: TokenizedDataset
+    test_dataset: TokenizedDataset
+    num_labels: int
 
 
-def tokenize_data(data_df, tokenizer, max_length=128):
-    """
-    Simply tokenizes the list of texts in data_df['text'], returns a dict with keys
-    'input_ids', 'attention_mask', (and possibly 'token_type_ids'—depending on the tokenizer).
-    """
-    return tokenizer(
-        data_df['text'].tolist(),
-        padding=True,
+def _load_token_cache(path: Path) -> dict[str, torch.Tensor] | None:
+    if not path.exists():
+        return None
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _tokenize_and_cache(
+    texts: list[str], tokenizer: object, path: Path, input_length: int
+) -> dict[str, torch.Tensor]:
+    cached = _load_token_cache(path)
+    if cached is not None:
+        return cached
+    encodings = tokenizer(
+        texts,
+        padding="max_length",
         truncation=True,
-        max_length=max_length,
-        return_tensors='pt'
+        max_length=input_length,
+        return_tensors="pt",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dict(encodings), path)
+    return dict(encodings)
+
+
+def load_domain(
+    dataset: str,
+    model_name: str,
+    device: str,
+    prototype_dim: int,
+    input_length: int = INPUT_LENGTH,
+    hf_token: str | None = None,
+) -> DomainData:
+    train_path = PREPROCESS_DIR / dataset / "train.csv"
+    test_path = PREPROCESS_DIR / dataset / "test.csv"
+    if not train_path.exists() or not test_path.exists():
+        raise FileNotFoundError(
+            f"Missing {train_path} or {test_path}. Run `python run0_prepare_data.py` first."
+        )
+
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+    for frame_name, frame in (("train", train_df), ("test", test_df)):
+        if not {"text", "label"}.issubset(frame.columns):
+            raise ValueError(f"{frame_name} data for {dataset} must contain text and label columns")
+        frame["text"] = frame["text"].fillna("").astype(str)
+        frame["label"] = frame["label"].astype(int)
+
+    labels = sorted(train_df["label"].unique().tolist())
+    if labels != list(range(len(labels))):
+        raise ValueError(f"Training labels for {dataset} are not contiguous from zero: {labels}")
+
+    backbone = ModelWrapper(
+        model_name=model_name,
+        device=device,
+        prototype_dim=prototype_dim,
+        hf_token=hf_token,
+    )
+    cache_prefix = CACHE_DIR / "tokens" / dataset
+    train_tokens = _tokenize_and_cache(
+        train_df["text"].tolist(),
+        backbone.tokenizer,
+        cache_prefix / f"train_{model_name}_len{input_length}.pt",
+        input_length,
+    )
+    test_tokens = _tokenize_and_cache(
+        test_df["text"].tolist(),
+        backbone.tokenizer,
+        cache_prefix / f"test_{model_name}_len{input_length}.pt",
+        input_length,
+    )
+
+    return DomainData(
+        backbone=backbone,
+        tokenizer=backbone.tokenizer,
+        train_df=train_df,
+        test_df=test_df,
+        train_dataset=TokenizedDataset(train_tokens, train_df["label"].to_numpy()),
+        test_dataset=TokenizedDataset(test_tokens, test_df["label"].to_numpy()),
+        num_labels=len(labels),
     )
 
 
-def extract_layer_encodings(
-    backbone: ModelWrapper,
-    encodings: Dict[str, torch.Tensor],
-    batch_size: int = 32,
-) -> torch.Tensor:
-    """
-    Runs inputs through the frozen LLM encoder (up to 2/3 depth)
-    and returns the last‐token residual hidden state for each example.
-
-    Args:
-        backbone:     your ModelWrapper with .encoder set to a ResidualWrapper
-        encodings:    dict of tensors from tokenizer(..., return_tensors="pt")
-                      must contain at least 'input_ids' and (optionally) 'attention_mask'
-        batch_size:   how many examples per forward pass
-
-    Returns:
-        latent_encodings: Tensor, shape (N, hidden_size)
-    """
-    device = backbone.device
-    # build a simple dataset of input_ids (+ attention_mask if present)
-    input_ids = encodings['input_ids']
-    attn_mask = encodings.get('attention_mask', None)
-
-    if attn_mask is not None:
-        ds = TensorDataset(input_ids, attn_mask)
-    else:
-        ds = TensorDataset(input_ids)
-
-    loader = DataLoader(ds, batch_size=batch_size)
-    backbone.eval()
-
-    all_feats = []
-    with torch.no_grad():
-        for batch in loader:
-            input_batch = batch[0].to(device)
-            if attn_mask is not None:
-                mask_batch = batch[1].to(device)
-            else:
-                mask_batch = None
-
-            # forward_type='enc' grabs the residual from the hook
-            feats = backbone(
-                input_ids=input_batch,
-                attention_mask=mask_batch,
-                forward_type='collect_llm_encodings'
-            )
-
-            # if you get a full sequence (B, S, H), pick the last token
-            if feats.ndim == 3:
-                feats = feats[:, -1, :]
-
-            all_feats.append(feats.cpu())
-
-    latent_encodings = torch.cat(all_feats, dim=0)
-    return latent_encodings
+def stratified_indices(labels: Sequence[int], seed: int) -> tuple[list[int], list[int]]:
+    indices = np.arange(len(labels))
+    train_indices, val_indices = train_test_split(
+        indices,
+        train_size=TRAIN_FRACTION,
+        random_state=seed,
+        stratify=np.asarray(labels),
+    )
+    return train_indices.tolist(), val_indices.tolist()
 
 
-def load_domain(args):
-    """
-    1) Reads train.csv / test.csv for the given dataset (args.dataset).
-    2) Instantiates a ModelWrapper(args.model).
-    3) Loads (or tokenizes & caches) input tokens for train/test.
-    4) Loads (or extracts & caches) intermediate layer encodings for train/test.
-    5) Wraps everything into DataLoaders and returns a dictionary of utilities.
-    """
+def subset_loader(
+    dataset: Dataset,
+    indices: Sequence[int],
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    subset = Subset(dataset, list(indices))
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        generator=generator if shuffle else None,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    # ──────────────── STEP 1: Read CSVs ────────────────
-    train_path = f'datasets/preprocess/{args.dataset}/train.csv'
-    test_path  = f'datasets/preprocess/{args.dataset}/test.csv'
-    if not os.path.exists(train_path) or not os.path.exists(test_path):
-        raise FileNotFoundError(f"Could not find CSV files at {train_path} or {test_path}")
 
-    train_df = pd.read_csv(train_path)
-    test_df  = pd.read_csv(test_path)
+def full_loader(dataset: Dataset, batch_size: int) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    # Number of labels (assumes a column named 'label' in each CSV)
-    num_labels = len(train_df['label'].value_counts())
 
-    # ──────────────── STEP 2: Instantiate BackBone ────────────────
-    model = ModelWrapper(model_name=args.model, device=args.device, no_llm_head=True, prototype_dim=args.prototype_dim)
+def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    model_inputs = {
+        "input_ids": batch["input_ids"].to(device),
+        "attention_mask": batch["attention_mask"].to(device),
+    }
+    labels = batch["labels"].to(device)
+    return model_inputs, labels
 
-    # We can grab the config directly from the model object:
-    config = model.config
 
-    # ──────────────── STEP 3: Tokenize (or load cached) ────────────────
-    # We'll cache under filenames that include both dataset and model name.
-    train_tokens_path = f'datasets/preprocess/{args.dataset}/train_tokens_{args.model}.pt'
-    test_tokens_path  = f'datasets/preprocess/{args.dataset}/test_tokens_{args.model}.pt'
+@torch.no_grad()
+def evaluate(model: LMProtoNet, loader: DataLoader) -> dict[str, float]:
+    model.eval()
+    predictions: list[int] = []
+    labels_all: list[int] = []
+    for batch in loader:
+        model_inputs, labels = _move_batch(batch, model.backbone.device)
+        logits = model(**model_inputs)["logits"]
+        predictions.extend(torch.argmax(logits, dim=1).cpu().tolist())
+        labels_all.extend(labels.cpu().tolist())
 
-    if os.path.exists(train_tokens_path) and os.path.exists(test_tokens_path):
-        print("Loading tokenized inputs from cache...")
-        train_tokens = torch.load(train_tokens_path, weights_only=False)
-        test_tokens  = torch.load(test_tokens_path, weights_only=False)
-    else:
-        print("Tokenizing data (this may take a while)...")
-        train_tokens = tokenize_data(train_df, model.tokenizer, max_length=args.input_size)
-        test_tokens  = tokenize_data(test_df, model.tokenizer, max_length=args.input_size)
-        os.makedirs(os.path.dirname(train_tokens_path), exist_ok=True)
-        torch.save(train_tokens, train_tokens_path)
-        torch.save(test_tokens, test_tokens_path)
-
-    
-    # ──────────────── STEP 4: Extract Layer Encodings (or load cached) for LLM models only
-    if model.model_type=='llm':
-        train_encodings_path = f'datasets/preprocess/{args.dataset}/train_encodings_{args.model}.pt'
-        test_encodings_path  = f'datasets/preprocess/{args.dataset}/test_encodings_{args.model}.pt'
-
-        if os.path.exists(train_encodings_path) and os.path.exists(test_encodings_path):
-            print("Loading layer‐wise encodings from cache...")
-            train_encodings = torch.load(train_encodings_path)
-            test_encodings  = torch.load(test_encodings_path)
-        else:
-        
-            print("Extracting layer‐wise encodings (this may take a while)...")
-            train_encodings = extract_layer_encodings(model, train_tokens, batch_size=32)
-            test_encodings  = extract_layer_encodings(model, test_tokens,  batch_size=32)
-
-            # Save for next time:
-            os.makedirs(os.path.dirname(train_encodings_path), exist_ok=True)
-            torch.save(train_encodings, train_encodings_path)
-            torch.save(test_encodings, test_encodings_path)
-
-        train_dataset_enc = EmbeddingDataset(train_encodings, train_df['label'].values)
-        test_dataset_enc  = EmbeddingDataset(test_encodings,  test_df['label'].values)
-    else:
-        train_dataset_enc = None
-        test_dataset_enc  = None
-
-    # ──────────────── STEP 5: Wrap Everything in Datasets & DataLoaders ────────────────
-    train_dataset = CustomDataset(train_tokens, train_df['label'].values)
-    test_dataset  = CustomDataset(test_tokens,  test_df['label'].values)
-
-    
-    data_utils = {
-        "model": model,
-        "tokenizer": model.tokenizer,
-        "train_dataset": train_dataset,
-        "test_dataset": test_dataset,
-        # "train_labels": train_df['label'].values,
-        # "test_labels": test_df['label'].values,
-        "train_df": train_df,
-        "test_df": test_df,
-        "num_labels": num_labels,
-        "config": config,
-        "train_dataset_enc": train_dataset_enc,
-        "test_dataset_enc": test_dataset_enc
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels_all, predictions, average="macro", zero_division=0
+    )
+    return {
+        "accuracy": float(accuracy_score(labels_all, predictions)),
+        "precision_macro": float(precision),
+        "recall_macro": float(recall),
+        "f1_macro": float(f1),
     }
 
-    return data_utils
 
-
-def beam_search_subsequence(text, prototype, model, tokenizer, device, window_sizes=range(3, 11), batch_size=32):
-    """
-    Finds the best matching contiguous subsequence (of length 3-10) of 'text' whose BERT [CLS] embedding best matches 'prototype'.
-    
-    It computes the candidate scores in batches on the GPU. If none of the candidates has a lower distance (or higher similarity)
-    than the full text, then it returns the full text's embedding and text.
-    
-    Args:
-        text (str): Input text.
-        prototype (torch.Tensor): Prototype embedding (1D tensor).
-        bert_model: Pretrained BERT model.
-        tokenizer: Corresponding tokenizer.
-        device (str): Device string (e.g., 'cuda').
-        window_sizes (iterable): Sequence lengths to consider (default: 3 to 10).
-        batch_size (int): Batch size for encoding candidates.
-        distance_func (str): Either 'l2' or 'cosine'.
-    
-    Returns:
-        best_embedding (torch.Tensor): Embedding of the best candidate.
-        best_candidate_text (str): The candidate text.
-    """
-    import torch
-    import torch.nn.functional as F
-    
-    words = text.split()
-    
-    # Compute the full text embedding and normalize it.
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding="max_length", max_length=128).to(device)
-    with torch.no_grad():
-        outputs = model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
-        full_embedding = outputs['cls_rep_normalized']
-    
-    # full_embedding = F.normalize(full_embedding, p=2, dim=0)
-    prototype = F.normalize(prototype, p=2, dim=0)
-    
-    # If text is too short, return full text.
-    if len(words) < 3:
-        return full_embedding[0], text
-        
-    original_score = torch.norm(full_embedding - prototype).item()
-    print(f"Distance to original text: {original_score}, text = {text}")
-    
-    # Generate all candidate contiguous subsequences for window sizes 3 to 10.
-    candidates = []
-    for win_size in window_sizes:
-        for i in range(len(words) - win_size + 1):
-            candidates.append(" ".join(words[i:i+win_size]))
-    
-    # Batch encode all candidate texts.
-    all_embeddings = []
-    for i in range(0, len(candidates), batch_size):
-        batch_texts = candidates[i:i+batch_size]
-        inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-        with torch.no_grad():
-            outputs = model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
-            batch_embeddings = outputs['cls_rep_normalized']
-        all_embeddings.append(batch_embeddings)
-    all_embeddings = torch.cat(all_embeddings, dim=0)
-    
-    distances = torch.norm(all_embeddings - prototype.unsqueeze(0), dim=1)
-    best_idx = torch.argmin(distances).item()
-    best_score = distances[best_idx].item()
-    
-    print(f"Best distance found in subsequences: {best_score}, text={candidates[best_idx]}")
-        
-    best_embedding = all_embeddings[best_idx]
-    best_candidate_text = candidates[best_idx]
-        
-    return best_embedding, best_candidate_text
-
-    
-
-
-def evaluate_loaders(train_loader_non_random, val_loader, model, device, just_eval=False):
-    
+@torch.no_grad()
+def encode_loader(model: LMProtoNet, loader: DataLoader) -> torch.Tensor:
     model.eval()
-    # Initialize counters for prototype activations per class
-    num_total_prototypes = model.num_total_prototypes
-    num_classes = model.num_labels
-    
-    # Create counters for each prototype x class combination
-    # Shape: [num_total_prototypes, num_classes]
-    train_proto_class_activations = torch.zeros((num_total_prototypes, num_classes), device=device)
-    val_proto_class_activations = torch.zeros((num_total_prototypes, num_classes), device=device)
-    
-    if not just_eval:
-        total_train_correct = 0
-        for batch in tqdm(train_loader_non_random, desc="Evaluating training acc"):
-            with torch.no_grad():
-    
-                # Get logits and losses from the model.
-                if model.backbone.model_type=='bert':
-                    labels = batch['labels'].to(device)
-                    outputs = model(input_ids=batch['input_ids'].to(device) , attention_mask=batch['attention_mask'].to(device), forward_type='train')
-                    
-                # Get logits and losses from the model.
-                elif model.backbone.model_type=='llm':
-                    labels = batch[1].to(device)
-                    outputs = model(llm_encodings=batch[0].to(device), forward_type='train')
-                    
-                all_similarities = outputs['acts']
-                logits = outputs['logits']
-                
-                # Track which prototypes are maximally activated for each example
-                max_proto_indices = torch.argmax(all_similarities, dim=1)  # [batch_size]
-                
-                # For each example, increment the counter for the max prototype and actual class
-                for i, (proto_idx, class_idx) in enumerate(zip(max_proto_indices, labels)):
-                    train_proto_class_activations[proto_idx, class_idx] += 1
-                    
-                preds = torch.argmax(logits, dim=1)
-                total_train_correct += (preds == labels).sum().item()
-        orig_train_acc = total_train_correct / len(train_loader_non_random.dataset)
-        
-        # Print activations per prototype and class
-        print("\nTraining Set Prototype Activations by Class:")
-        print("-" * 50)
-        for p in range(num_total_prototypes):
-            activation_str = f"Prototype {p}: "
-            for c in range(num_classes):
-                count = train_proto_class_activations[p, c].item()
-                if count > 0:
-                    activation_str += f"{count:.0f} times class {c}, "
-            # Remove trailing comma and space
-            activation_str = activation_str.rstrip(", ")
-            print(activation_str)
-    else:
-        orig_train_acc = 0.0
-    
-    total_val_correct = 0
-    for batch in tqdm(val_loader, desc="Evaluating validation acc"):
-        with torch.no_grad():
-            # Get logits and losses from the model.
-            if model.backbone.model_type=='bert':
-                labels = batch['labels'].to(device)
-                outputs = model(input_ids=batch['input_ids'].to(device) , attention_mask=batch['attention_mask'].to(device), forward_type='train')
-                
-            # Get logits and losses from the model.
-            elif model.backbone.model_type=='llm':
-                labels = batch[1].to(device)
-                outputs = model(llm_encodings=batch[0].to(device), forward_type='train')
-                
-            all_similarities = outputs['acts']
-            logits = outputs['logits']
-            
-            # Track which prototypes are maximally activated for each example
-            max_proto_indices = torch.argmax(all_similarities, dim=1)
-            
-            # For each example, increment the counter for the max prototype and actual class
-            for i, (proto_idx, class_idx) in enumerate(zip(max_proto_indices, labels)):
-                val_proto_class_activations[proto_idx, class_idx] += 1
-                
-            preds = torch.argmax(logits, dim=1)
-            total_val_correct += (preds == labels).sum().item()
-    orig_val_acc = total_val_correct / len(val_loader.dataset)
-    
-    model.train()
-    return orig_train_acc, orig_val_acc
+    outputs: list[torch.Tensor] = []
+    for batch in tqdm(loader, desc="Encoding", leave=False):
+        model_inputs, _ = _move_batch(batch, model.backbone.device)
+        outputs.append(model(**model_inputs)["representation"].cpu())
+    return torch.cat(outputs, dim=0)
 
 
+@torch.no_grad()
+def encode_texts(
+    model: LMProtoNet,
+    texts: Sequence[str],
+    input_length: int,
+    batch_size: int = 32,
+) -> torch.Tensor:
+    model.eval()
+    all_embeddings: list[torch.Tensor] = []
+    texts = [str(text) for text in texts]
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start : start + batch_size]
+        tokens = model.backbone.tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=input_length,
+            return_tensors="pt",
+        )
+        representations = model.backbone(
+            input_ids=tokens["input_ids"],
+            attention_mask=tokens["attention_mask"],
+        )
+        all_embeddings.append(F.normalize(representations, p=2, dim=1).cpu())
+    return torch.cat(all_embeddings, dim=0)
 
 
-from sklearn.cluster import KMeans
-import torch
-from tqdm import tqdm
-
-from sklearn.cluster import KMeans
-import torch
-from tqdm import tqdm
-
-def get_unsupervised_prototypes(backbone, dataloader, num_labels, num_prototypes, device, max_batches=30, noise_scale=1e-3):
-    """
-    Collect representations, then for each class:
-      - If M ≥ P: run K-means with P clusters.
-      - If 0 < M < P: run K-means with M clusters, then duplicate the first prototype
-        with a bit of Gaussian noise to pad up to P.
-      - If M = 0: sample P reps at random from the full dataset.
-    Returns a tensor of shape (num_labels * num_prototypes, D) where the first P rows
-    are for class 0, the next P for class 1, etc.
-    
-    noise_scale controls the standard deviation of the padding‐noise.
-    """
+@torch.no_grad()
+def initialize_prototypes(
+    backbone: ModelWrapper,
+    dataset: Dataset,
+    indices: Sequence[int],
+    labels: Sequence[int],
+    num_labels: int,
+    prototypes_per_class: int,
+    batch_size: int,
+    seed: int,
+    max_examples: int = 6400,
+) -> torch.Tensor:
+    selected_indices = list(indices)[:max_examples]
+    loader = subset_loader(dataset, selected_indices, batch_size, shuffle=False, seed=seed)
+    embeddings: list[torch.Tensor] = []
     backbone.eval()
-    reps_list, labels_list = [], []
+    for batch in tqdm(loader, desc="Initializing prototypes", leave=False):
+        embeddings.append(
+            F.normalize(
+                backbone(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                ),
+                p=2,
+                dim=1,
+            ).cpu()
+        )
+    matrix = torch.cat(embeddings, dim=0)
+    selected_labels = np.asarray(labels)[selected_indices]
 
-    if backbone.model_type == 'llm':
-        max_batches = 200
-
-    # 1) Collect all reps + labels
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting reps")):
-            if batch_idx >= max_batches:
-                break
-
-            if backbone.model_type == 'bert':
-                reps = backbone(
-                    input_ids      = batch['input_ids'].to(device),
-                    attention_mask = batch['attention_mask'].to(device),
-                    forward_type   = 'train'
-                )
-            elif backbone.model_type == 'llm':
-                reps = backbone(
-                    llm_encodings = batch[0].to(device),
-                    forward_type  = 'train'
-                )
-            else:
-                raise TypeError(f"Unsupported model_type: {backbone.model_type}")
-
-            reps_list.append(reps.cpu())
-            labels_list.append(batch['labels'].cpu())
-
-    all_reps   = torch.cat(reps_list,   dim=0)  # [N, D]
-    all_labels = torch.cat(labels_list, dim=0)  # [N]
-
-    # 2) Per-class prototypes
-    centroids_per_class = []
-    for class_idx in range(num_labels):
-        mask       = (all_labels == class_idx)
-        class_reps = all_reps[mask]            # [M, D]
-        M          = class_reps.size(0)
-        P          = num_prototypes
-
-        if M >= P:
-            # enough data → straight K-means(P)
-            kmeans = KMeans(n_clusters=P, n_init='auto', random_state=0)
-            kmeans.fit(class_reps.numpy())
-            cents = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
-
-        elif M > 0:
-            # underpopulated → kmeans(M) + padded duplicates with noise
-            kmeans = KMeans(n_clusters=M, n_init='auto', random_state=0)
-            kmeans.fit(class_reps.numpy())
-            base_cents = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)  # [M, D]
-
-            # Duplicate the first centroid with jitter
-            first = base_cents[0:1]                             # [1, D]
-            pad   = first.repeat(P - M, 1)                      # [P-M, D]
-            noise = torch.randn_like(pad) * noise_scale         # small Gaussian noise
-            cents = torch.cat([base_cents, pad + noise], dim=0) # [P, D]
-
-        else:
-            # no examples → random samples from the full set
-            N = all_reps.size(0)
-            if N == 0:
-                raise ValueError("No data available to initialize any prototypes.")
-            idxs = torch.randint(0, N, (P,))
-            cents = all_reps[idxs]  # [P, D]
-
-        centroids_per_class.append(cents)
-
-    # 3) Stack so rows [0:P] → class 0, [P:2P] → class 1, etc.
-    centroids = torch.cat(centroids_per_class, dim=0)  # [num_labels * P, D]
-    return centroids
+    centroids: list[torch.Tensor] = []
+    for class_index in range(num_labels):
+        class_matrix = matrix[selected_labels == class_index]
+        if len(class_matrix) < prototypes_per_class:
+            raise ValueError(
+                f"Class {class_index} has only {len(class_matrix)} initialization examples, "
+                f"fewer than {prototypes_per_class} prototypes"
+            )
+        kmeans = KMeans(n_clusters=prototypes_per_class, n_init=10, random_state=seed)
+        kmeans.fit(class_matrix.numpy())
+        centroids.append(torch.tensor(kmeans.cluster_centers_, dtype=torch.float32))
+    return F.normalize(torch.cat(centroids, dim=0), p=2, dim=1)
 
 
+def checkpoint_path(model: str, dataset: str, seed: int) -> Path:
+    from src.config import WEIGHTS_DIR
 
-# def get_unsupervised_prototypes(backbone, dataloader, num_labels, num_prototypes, device, max_batches=30):
-#     backbone.eval()
-#     all_reps = []
-
-#     if backbone.model_type=='llm':
-#         max_batches = 200
-
-#     with torch.no_grad():
-#         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Collecting data for unsupervised prototype init")):
-#             if batch_idx >= max_batches:
-#                 break
-
-#             label = batch['label']
-
-#             if backbone.model_type == 'bert':
-#                 reps = backbone(input_ids=batch['input_ids'].to(device),
-#                                 attention_mask=batch['attention_mask'].to(device),
-#                                 forward_type='train')
-#             elif backbone.model_type == 'llm':
-#                 reps = backbone(llm_encodings=batch[0].to(device), forward_type='train')
-#             else:
-#                 raise TypeError('Unsupported model_type in prototype initialization')
-
-#             all_reps.append(reps.cpu())
-
-#     all_reps_tensor = torch.cat(all_reps, dim=0)  # [N, D]
-    
-#     # Run k-means on the latent space to get diverse centers
-#     kmeans = KMeans(n_clusters=num_prototypes, n_init='auto', random_state=0)
-#     kmeans.fit(all_reps_tensor.numpy())
-    
-#     centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)  # [num_prototypes, D]
-#     return centroids
+    return WEIGHTS_DIR / f"learned_{model}_{dataset}_seed{seed}.pt"
 
 
+def save_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
+def load_checkpoint(path: Path, map_location: str | torch.device = "cpu") -> dict:
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
-    
+
+def instantiate_from_checkpoint(
+    checkpoint: dict,
+    device: str,
+    hf_token: str | None = None,
+    backbone: ModelWrapper | None = None,
+) -> LMProtoNet:
+    metadata = checkpoint["metadata"]
+    if backbone is None:
+        backbone = ModelWrapper(
+            model_name=metadata["model"],
+            device=device,
+            prototype_dim=int(metadata["prototype_dim"]),
+            hf_token=hf_token,
+        )
+    model = LMProtoNet(
+        backbone=backbone,
+        num_labels=int(metadata["num_labels"]),
+        num_protos_per_class=int(metadata["prototypes_per_class"]),
+    )
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    model.to(device)
+    model.eval()
+    return model
