@@ -4,19 +4,21 @@ This repository trains the prototype classifiers, performs nearest-neighbor and 
 
 ## 1. Environment
 
-The full pipeline is intended for Linux with four NVIDIA CUDA GPUs and Python 3.11.
+Python 3.11 is recommended. CUDA GPUs are used automatically when available; CPU-only execution is also supported.
 
 ```bash
 conda create -n prototype-projection python=3.11 pip -y
 conda activate prototype-projection
 
-# Reference CUDA 12.4 installation
+# On Linux with NVIDIA GPUs, install the CUDA build first:
 python -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
   --index-url https://download.pytorch.org/whl/cu124
+
+# On CPU-only systems or macOS, skip the command above.
 python -m pip install -r requirements.txt
 ```
 
-Check that CUDA is available:
+Check the installation:
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
@@ -50,9 +52,9 @@ Accept access to `meta-llama/Meta-Llama-3-8B-Instruct` on Hugging Face, then set
 
 ```bash
 export HF_TOKEN="your_token"
-export PAPER_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3"
-export OPTIMIZER_GPU_IDS="1,2,3"
 ```
+
+Hardware is detected automatically. With 0 GPUs everything runs on CPU (very slowly, and with enough RAM to load the 8B optimizer model); with 1 GPU the classifier uses it and the optimizer runs on CPU; with 2-3 GPUs the remaining devices host as many optimizer models as possible; with 4+ GPUs the paper setup uses one classifier GPU and three optimizer GPUs. The optimizer always produces three logical LLM responses per step, running them sequentially when fewer than three physical models are loaded.
 
 For the five qualitative judges, implement this function in `src/judge_clients.py`:
 

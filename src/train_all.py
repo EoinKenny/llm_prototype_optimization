@@ -1,4 +1,4 @@
-"""Schedule all 90 paper training runs across the configured CUDA devices."""
+"""Schedule all 90 paper training runs across automatically detected devices."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ from pathlib import Path
 
 from src.config import DATASETS, DATASET_SETTINGS, DEVICES, QUANT_MODELS, ROOT, SEEDS
 from src.functions import checkpoint_path
+from src.devices import normalize_devices
 
 
 def main() -> None:
@@ -17,6 +18,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--devices", nargs="*", default=DEVICES)
     args = parser.parse_args()
+    args.devices = normalize_devices(args.devices)
 
     jobs = []
     for dataset in DATASETS:
@@ -33,6 +35,8 @@ def main() -> None:
         return
     if not args.devices:
         raise RuntimeError("At least one device is required")
+
+    print(f"Training devices: {', '.join(args.devices)}")
 
     device_cycle = itertools.cycle(args.devices)
     running: list[tuple[subprocess.Popen, str, tuple[str, str, int]]] = []

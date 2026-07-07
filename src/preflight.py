@@ -16,6 +16,7 @@ from src.config import (
     QUAL_MODELS,
     QUANT_MODELS,
     SEEDS,
+    HARDWARE,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +93,7 @@ def main() -> None:
         f"Static preflight passed for {len(python_files)} Python files; "
         "root layout and paper configuration are consistent."
     )
+    print(HARDWARE.describe())
 
 
 if __name__ == "__main__":

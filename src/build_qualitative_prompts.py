@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from src.config import (
+    CLASSIFIER_DEVICE,
     DATASETS,
     EVAL_BATCH_SIZE,
     INPUT_LENGTH,
@@ -127,7 +128,7 @@ def build_configuration(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default=CLASSIFIER_DEVICE)
     parser.add_argument("--examples-per-config", type=int, default=QUALITATIVE_EXAMPLES_PER_CONFIG)
     parser.add_argument("--output", default=str(RESULTS_DIR / "qualitative" / "prompts.csv"))
     args = parser.parse_args()

@@ -2,7 +2,7 @@
 
 This implementation follows Section 3.2 and Appendix H:
 - Meta-Llama-3-8B-Instruct
-- three parallel LLM copies
+- three logical LLM generations per iteration (parallel where hardware permits)
 - 10 retained candidates
 - 10 proposals per LLM and iteration
 - nearest-neighbor pool q=20
@@ -37,7 +37,8 @@ from src.config import (
     NEAREST_NEIGHBOR_POOL,
     NEIGHBORS_PER_PROMPT,
     NUM_PARALLEL_LLMS,
-    OPTIMIZER_GPU_IDS,
+    CLASSIFIER_DEVICE,
+    OPTIMIZER_DEVICES,
     OPTIMIZER_LLM_ID,
     OPTIMIZER_TEMPERATURE,
     OPTIMIZER_TOP_P,
@@ -63,6 +64,7 @@ from src.functions import (
     full_loader,
 )
 from src.prompts import initialization_prompt, optimization_prompt
+from src.devices import normalize_devices, optimizer_dtype, pipeline_device
 
 
 
@@ -112,33 +114,57 @@ def unique_texts(values: Sequence[str]) -> list[str]:
 
 
 class ParallelOptimizerLLMs:
+    """Serve three logical optimizer calls using as many physical models as fit.
+
+    A physical model is loaded once per configured device. If fewer physical
+    models than logical calls are available, calls are distributed round-robin
+    and executed sequentially on each physical model.
+    """
+
     def __init__(
         self,
         model_id: str,
-        gpu_ids: Sequence[str],
-        copies: int,
+        devices: Sequence[str],
+        logical_copies: int,
         hf_token: str | None,
     ) -> None:
-        if copies < 1:
-            raise ValueError("At least one optimizer LLM copy is required")
-        if len(gpu_ids) < copies:
-            raise ValueError(f"Need {copies} GPU IDs, received {gpu_ids}")
+        if logical_copies < 1:
+            raise ValueError("At least one logical optimizer LLM call is required")
+        if not devices:
+            raise ValueError("At least one optimizer device is required")
+
+        self.logical_copies = int(logical_copies)
+        self.devices = normalize_devices(devices)
         self.pipelines = []
         self.tokenizers = []
         token = hf_token or os.getenv("HF_TOKEN")
-        for index in range(copies):
-            gpu_id = int(str(gpu_ids[index]).replace("cuda:", ""))
-            print(f"Loading optimizer LLM copy {index + 1}/{copies} on cuda:{gpu_id}")
+
+        for index, device in enumerate(self.devices):
+            dtype = optimizer_dtype(device)
+            print(
+                f"Loading optimizer LLM model {index + 1}/{len(self.devices)} "
+                f"on {device} with {str(dtype).replace('torch.', '')}"
+            )
             pipeline = transformers.pipeline(
                 "text-generation",
                 model=model_id,
                 tokenizer=model_id,
-                device=gpu_id,
-                torch_dtype=torch.bfloat16,
+                device=pipeline_device(device),
+                torch_dtype=dtype,
                 token=token,
+                model_kwargs={"low_cpu_mem_usage": True},
             )
             self.pipelines.append(pipeline)
             self.tokenizers.append(pipeline.tokenizer)
+
+        print(
+            f"Using {len(self.pipelines)} physical optimizer model(s) for "
+            f"{self.logical_copies} logical generation(s) per step."
+        )
+
+    @property
+    def physical_copies(self) -> int:
+        return len(self.pipelines)
 
     @staticmethod
     def _chat_prompt(tokenizer: object, prompt: str) -> str:
@@ -150,9 +176,9 @@ class ParallelOptimizerLLMs:
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return f"System: You are a helpful assistant.\nUser: {prompt}\nAssistant:"
 
-    def _query_one(self, index: int, prompt: str, max_new_tokens: int) -> str:
-        formatted = self._chat_prompt(self.tokenizers[index], prompt)
-        result = self.pipelines[index](
+    def _query_one(self, worker_index: int, prompt: str, max_new_tokens: int) -> str:
+        formatted = self._chat_prompt(self.tokenizers[worker_index], prompt)
+        result = self.pipelines[worker_index](
             formatted,
             max_new_tokens=max_new_tokens,
             do_sample=True,
@@ -162,18 +188,44 @@ class ParallelOptimizerLLMs:
         )
         return str(result[0].get("generated_text", ""))
 
+    def _query_worker_batch(
+        self,
+        worker_index: int,
+        indexed_prompts: Sequence[tuple[int, str]],
+        max_new_tokens: int,
+    ) -> list[tuple[int, str]]:
+        return [
+            (prompt_index, self._query_one(worker_index, prompt, max_new_tokens))
+            for prompt_index, prompt in indexed_prompts
+        ]
+
     def query(self, prompts: Sequence[str], max_new_tokens: int = 768) -> list[str]:
-        if len(prompts) != len(self.pipelines):
-            raise ValueError("The number of prompts must equal the number of LLM copies")
+        if len(prompts) != self.logical_copies:
+            raise ValueError(
+                f"Expected {self.logical_copies} prompts, received {len(prompts)}"
+            )
+
+        assignments: list[list[tuple[int, str]]] = [
+            [] for _ in range(self.physical_copies)
+        ]
+        for prompt_index, prompt in enumerate(prompts):
+            assignments[prompt_index % self.physical_copies].append((prompt_index, prompt))
+
         responses: list[str] = [""] * len(prompts)
-        with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
-            future_to_index = {
-                executor.submit(self._query_one, index, prompt, max_new_tokens): index
-                for index, prompt in enumerate(prompts)
-            }
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                responses[index] = future.result()
+        with ThreadPoolExecutor(max_workers=self.physical_copies) as executor:
+            futures = [
+                executor.submit(
+                    self._query_worker_batch,
+                    worker_index,
+                    worker_prompts,
+                    max_new_tokens,
+                )
+                for worker_index, worker_prompts in enumerate(assignments)
+                if worker_prompts
+            ]
+            for future in as_completed(futures):
+                for prompt_index, response in future.result():
+                    responses[prompt_index] = response
         return responses
 
 
@@ -209,7 +261,7 @@ def optimize_one_prototype(
     rng = random.Random(seed)
 
     initialization_prompts = []
-    for _ in range(len(llms.pipelines)):
+    for _ in range(llms.logical_copies):
         examples = rng.sample(nearest_pool, k=min(NEIGHBORS_PER_PROMPT, len(nearest_pool)))
         initialization_prompts.append(
             initialization_prompt(examples, CANDIDATES_PER_LLM, dataset)
@@ -233,7 +285,7 @@ def optimize_one_prototype(
 
     for iteration in range(1, iterations + 1):
         prompts = []
-        for _ in range(len(llms.pipelines)):
+        for _ in range(llms.logical_copies):
             examples = rng.sample(nearest_pool, k=min(NEIGHBORS_PER_PROMPT, len(nearest_pool)))
             prompts.append(
                 optimization_prompt(
@@ -392,7 +444,9 @@ def run_configuration(
         "experiment": settings["experiment"],
         "iterations": settings["iterations"],
         "optimizer_llm": OPTIMIZER_LLM_ID,
-        "num_parallel_llms": len(llms.pipelines),
+        "num_parallel_llms": llms.logical_copies,
+        "num_physical_optimizer_models": llms.physical_copies,
+        "optimizer_devices": llms.devices,
         "candidate_population_size": CANDIDATES_RETAINED,
         "nearest_neighbor_pool_size": NEAREST_NEIGHBOR_POOL,
         "neighbors_sampled_per_prompt": NEIGHBORS_PER_PROMPT,
@@ -420,8 +474,14 @@ def main() -> None:
     parser.add_argument("--datasets", nargs="*", default=DATASETS, choices=DATASETS)
     parser.add_argument("--models", nargs="*", default=QUANT_MODELS, choices=QUANT_MODELS)
     parser.add_argument("--seeds", nargs="*", type=int, default=SEEDS)
-    parser.add_argument("--device", default="cuda:0", help="Classifier/encoder device")
-    parser.add_argument("--llm-gpu-ids", nargs="*", default=OPTIMIZER_GPU_IDS)
+    parser.add_argument("--device", default=CLASSIFIER_DEVICE, help="Classifier/encoder device")
+    parser.add_argument(
+        "--llm-devices", "--llm-gpu-ids",
+        dest="llm_devices",
+        nargs="*",
+        default=OPTIMIZER_DEVICES,
+        help="Physical devices for optimizer model instances (auto-detected by default)",
+    )
     parser.add_argument("--llm-copies", type=int, default=NUM_PARALLEL_LLMS)
     parser.add_argument("--hf-token", default=None)
     parser.add_argument("--force", action="store_true")
@@ -430,8 +490,8 @@ def main() -> None:
     ensure_directories()
     llms = ParallelOptimizerLLMs(
         model_id=OPTIMIZER_LLM_ID,
-        gpu_ids=args.llm_gpu_ids,
-        copies=args.llm_copies,
+        devices=args.llm_devices,
+        logical_copies=args.llm_copies,
         hf_token=args.hf_token,
     )
     for seed in args.seeds:

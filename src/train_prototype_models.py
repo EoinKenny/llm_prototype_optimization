@@ -12,6 +12,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from src.config import (
+    CLASSIFIER_DEVICE,
     DATASET_SETTINGS,
     EARLY_STOPPING_PATIENCE,
     EVAL_BATCH_SIZE,
@@ -180,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", required=True, choices=sorted(DATASET_SETTINGS))
     parser.add_argument("--model", required=True)
     parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default=CLASSIFIER_DEVICE)
     parser.add_argument("--hf-token", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--prototypes-per-class", type=int, default=None)

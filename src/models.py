@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-from src.config import MODEL_IDS, PROTOTYPE_DIM
+from src.config import CLASSIFIER_DEVICE, MODEL_IDS, PROTOTYPE_DIM
 
 
 def _iter_module_list(value: object) -> list[nn.Module] | None:
@@ -51,7 +51,7 @@ class ModelWrapper(nn.Module):
     def __init__(
         self,
         model_name: str,
-        device: str = "cuda:0",
+        device: str = CLASSIFIER_DEVICE,
         prototype_dim: int = PROTOTYPE_DIM,
         hf_token: str | None = None,
     ) -> None:

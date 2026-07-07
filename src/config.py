@@ -5,8 +5,9 @@ Environment variables may override hardware-specific settings only.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
+
+from src.devices import build_hardware_plan
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "datasets"
@@ -74,9 +75,14 @@ DBPEDIA_TARGET_CLASSES = [
     1, 73, 36, 56, 54, 215, 39, 128, 90, 171,
 ]
 
-# Hardware only: e.g. PAPER_DEVICES=cuda:0,cuda:1,cuda:2,cuda:3
-DEVICES = [d.strip() for d in os.getenv("PAPER_DEVICES", "cuda:0,cuda:1,cuda:2,cuda:3").split(",") if d.strip()]
-OPTIMIZER_GPU_IDS = [d.strip() for d in os.getenv("OPTIMIZER_GPU_IDS", "1,2,3").split(",") if d.strip()]
+# Hardware is detected automatically. Environment variables remain available
+# as optional overrides: PAPER_DEVICES, CLASSIFIER_DEVICE, OPTIMIZER_DEVICES.
+HARDWARE = build_hardware_plan(logical_optimizer_copies=NUM_PARALLEL_LLMS)
+DEVICES = list(HARDWARE.training_devices)
+CLASSIFIER_DEVICE = HARDWARE.classifier_device
+OPTIMIZER_DEVICES = list(HARDWARE.optimizer_devices)
+# Backward-compatible name retained for older command lines/imports.
+OPTIMIZER_GPU_IDS = OPTIMIZER_DEVICES
 
 JUDGES = {
     "claude_sonnet_4_5": {
