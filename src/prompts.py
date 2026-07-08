@@ -75,7 +75,7 @@ Their similarity scores are:
 
 Can you suggest another {num_neighbors} guesses which are closer to 1?
 
-The prototype should represent a short, prototypical example of a positive
+The prototype should represent a short, prototypical example of a
 '{description}'.
 
 If a lot of your guesses are similar, you should try to diversify them to avoid
